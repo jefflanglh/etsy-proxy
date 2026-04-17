@@ -1,50 +1,49 @@
 import requests
 from flask import Flask, request
-import re
-import time
+import json
 
 app = Flask(__name__)
-ANT_API_KEY = "10f24def57b343d2872fffac037670cf"
 
 @app.route('/')
 def get_sales():
-    shop_name = request.args.get('shop')
-    if not shop_name: return "No shop name"
+    shop_name = request.args.get('shop', 'lezyicom')
     
-    # 强制加上随机后缀防止缓存
-    target_url = f"https://www.etsy.com/shop/{shop_name}?ref=simple-shop-header-name"
-    proxy_url = f"https://api.scrapingant.com/v2/general?url={target_url}&x-api-key={ANT_API_KEY}&browser=false"
+    # 这是 Etsy 内部的一个数据接口，通常防御比主页弱
+    api_url = f"https://www.etsy.com/api/v3/ajax/public/shop-home/id?shop_name={shop_name}"
     
-    # 我们只尝试 2 次，但单次等待时间拉长到 8 秒
-    for attempt in range(2):
-        try:
-            response = requests.get(proxy_url, timeout=40)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    
+    try:
+        # 第一步：尝试获取 Shop ID
+        r = requests.get(api_url, headers=headers, timeout=10)
+        
+        if r.status_code == 200:
+            data = r.json()
+            shop_id = data.get('id')
             
-            if response.status_code == 423:
-                time.sleep(8) # 暴力等待，强制释放并发位
-                continue
-            
-            if response.status_code == 200:
-                html = response.text
-                # 针对 Etsy 的多种 HTML 结构进行地毯式搜索
-                # 模式1: 数字 sales (如 1,234 sales)
-                match = re.search(r'([\d,]+)\s*[Ss]ales', html)
-                if match:
-                    return match.group(1).replace(',', '')
+            # 第二步：如果拿到了 ID，去另一个更简单的接口拿销量
+            if shop_id:
+                details_url = f"https://www.etsy.com/api/v3/ajax/public/shop-home/header?shop_id={shop_id}"
+                r2 = requests.get(details_url, headers=headers, timeout=10)
                 
-                # 模式2: 纯数字 (可能在特定 class 里)
-                match_alt = re.search(r'(\d+)\s*<[^>]*>[Ss]ales', html)
-                if match_alt:
-                    return match_alt.group(1)
-                
-                return "0"
+                # 在返回的乱码（HTML）中暴力搜索数字
+                if r2.status_code == 200:
+                    import re
+                    match = re.search(r'([\d,]+)\s*[Ss]ales', r2.text)
+                    if match:
+                        return match.group(1).replace(',', '')
             
-            return f"HTTP_{response.status_code}"
+            return "0"
+        else:
+            # 如果直接访问被封（403），我们只能退回到代理模式，但这次换一种简单的
+            return f"BLOCKED_BY_ETSY_{r.status_code}"
             
-        except Exception as e:
-            time.sleep(5)
-            
-    return "SERVER_BUSY_RETRY_LATER"
+    except Exception as e:
+        return f"ERROR_{str(e)}"
 
 def handler(event, context):
     return app(event, context)
