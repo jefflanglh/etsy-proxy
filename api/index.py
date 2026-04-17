@@ -1,46 +1,68 @@
 import requests
 from flask import Flask, request
 import re
+import time
 
 app = Flask(__name__)
+
+# 你的 ScrapingAnt API Token
 ANT_API_KEY = "10f24def57b343d2872fffac037670cf"
 
 @app.route('/')
 def get_sales():
+    # 获取 URL 中的 shop 参数，例如 ?shop=lezyicom
     shop_name = request.args.get('shop')
-    if not shop_name: return "Error: No shop name"
+    if not shop_name:
+        return "Error: No shop name provided"
     
-    # 强制访问澳洲站点路径
-    target_url = f"https://www.etsy.com/au/shop/{shop_name}"
+    # 使用标准 .com 域名，减少地区重定向干扰
+    target_url = f"https://www.etsy.com/shop/{shop_name}"
     
-    # ant_country=au 确保代理服务器也使用澳洲 IP，这样网页内容最准确
-    proxy_url = f"https://api.scrapingant.com/v2/general?url={target_url}&x-api-key={ANT_API_KEY}&browser=false&ant_country=au"
+    # 构建 ScrapingAnt 请求 URL
+    # browser=false 响应最快，节省额度
+    proxy_url = f"https://api.scrapingant.com/v2/general?url={target_url}&x-api-key={ANT_API_KEY}&browser=false"
     
-    try:
-        # 设置较长的超时，因为跨国代理可能稍慢
-        r = requests.get(proxy_url, timeout=20)
-        
-        if r.status_code == 423: 
-            return "Error: Concurrency limit reached. Wait 10s."
-        
-        if r.status_code != 200:
-            return f"Error: Proxy Status {r.status_code}"
+    # 针对免费版 1 个并发限制的自动重试机制
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(proxy_url, timeout=20)
             
-        html = r.text
-        
-        # 针对 Etsy 澳洲站源码的正则优化
-        # 匹配像 "12 sales" 或 "123销售" 之类的结构
-        match = re.search(r'([\d,]+)\s*(?:sales|Sales)', html)
-        
-        if match:
-            # 提取数字并去掉逗号
-            return match.group(1).replace(',', '')
-        
-        # 如果正则没抓到，尝试备用方案：寻找包含 "sales" 的特定位置
-        return "0" 
-        
-    except Exception as e:
-        return f"Error: {str(e)}"
+            # 如果触发并发限制 (423)，等待 3 秒后重试
+            if response.status_code == 423:
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+                    continue
+                else:
+                    return "Error: System Busy (423 Concurrency Limit)"
+            
+            # 如果请求成功
+            if response.status_code == 200:
+                html_content = response.text
+                
+                # 使用正则表达式匹配销量，兼容 "123 sales" 或 "1,234 Sales"
+                # Etsy 的源码中通常显示为 "XXXX sales"
+                match = re.search(r'([\d,]+)\s*(?:sales|Sales)', html_content)
+                
+                if match:
+                    # 提取第一组匹配值，并移除数字中的逗号
+                    sales_count = match.group(1).replace(',', '')
+                    return sales_count
+                else:
+                    # 如果匹配不到，可能是新店 0 销量，或者结构极其特殊
+                    return "0"
+            
+            # 其他 HTTP 错误
+            return f"Error: Proxy Status {response.status_code}"
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            return f"Error: {str(e)}"
 
+    return "Error: Unknown failure"
+
+# Vercel Serverless 环境必需的 Handler
 def handler(event, context):
     return app(event, context)
